@@ -45,6 +45,8 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* Connection key identifying one SMB TCP connection.
  * We treat the endpoint with port 445 as the server and the other
