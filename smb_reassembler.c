@@ -216,10 +216,19 @@ static void parse_write_request(const uint8_t *body, size_t len) {
     for (int i = 0; i < 8; i++)
         file_offset |= ((uint64_t)body[8 + i]) << (8 * i);
     const uint8_t *file_id = body + 24;
-    size_t data_start = data_offset;
-    size_t data_end = data_start + data_length;
-    if (len < data_end)
+    /* DataOffset in SMB2 is relative to the start of the SMB2 header (64 bytes
+     * before body).  Adjust so that data_start points into the body.
+     */
+    if (data_offset < 64) {
+        /* malformed offset; avoid underflow */
         return;
+    }
+    size_t data_start = (size_t)data_offset - 64;
+    size_t data_end = data_start + data_length;
+    if (len < data_end) {
+        /* not enough bytes in body */
+        return;
+    }
     const uint8_t *data = body + data_start;
     write_file_chunk(file_id, file_offset, data, data_length);
 }
@@ -253,12 +262,17 @@ static void record_pending_read(connection_t *conn, uint64_t msg_id, const uint8
 static void handle_read_response(connection_t *conn, uint64_t msg_id, const uint8_t *body, size_t len) {
     if (len < 16)
         return;
-    uint8_t data_offset = body[2];
+    uint16_t data_offset = (uint16_t)body[2] | ((uint16_t)body[3] << 8);
     uint32_t data_length = body[4] | (body[5] << 8) | (body[6] << 16) | (body[7] << 24);
-    size_t data_start = data_offset;
-    size_t data_end = data_start + data_length;
-    if (len < data_end)
+    /* DataOffset is relative to start of SMB2 header.  Adjust to body pointer. */
+    if (data_offset < 64) {
         return;
+    }
+    size_t data_start = (size_t)data_offset - 64;
+    size_t data_end = data_start + data_length;
+    if (len < data_end) {
+        return;
+    }
     const uint8_t *data = body + data_start;
     /* find matching pending read */
     pending_read_t **prev_ptr = &conn->smb[0].pending;
@@ -280,35 +294,66 @@ static void handle_read_response(connection_t *conn, uint64_t msg_id, const uint
 
 /* Parse and handle a single SMB2 message. */
 static void parse_smb2_message(connection_t *conn, int dir, const uint8_t *msg, size_t len) {
-    if (len < 64)
-        return;
-    /* Check protocol ID FE 'S' 'M' 'B' */
-    if (!(msg[0] == 0xFE && msg[1] == 'S' && msg[2] == 'M' && msg[3] == 'B'))
-        return;
-    uint16_t struct_size = msg[4] | (msg[5] << 8);
-    if (struct_size != 64)
-        return;
-    uint16_t command = msg[12] | (msg[13] << 8);
-    uint32_t flags = msg[16] | (msg[17] << 8) | (msg[18] << 16) | (msg[19] << 24);
-    uint64_t msg_id = 0;
-    for (int i = 0; i < 8; i++)
-        msg_id |= ((uint64_t)msg[24 + i]) << (8 * i);
-    int is_response = (flags & SMB2_FLAGS_SERVER_TO_REDIR) != 0;
-    const uint8_t *body = msg + 64;
-    size_t body_len = len - 64;
-    if (!is_response) {
-        /* Request */
-        if (command == SMB2_READ && dir == 0) {
-            record_pending_read(conn, msg_id, body, body_len);
-        } else if (command == SMB2_WRITE && dir == 0) {
-            parse_write_request(body, body_len);
+    /* SMB2 messages can be compounded.  Iterate through each command in
+     * this NBSS payload.  Each SMB2 header contains a NextCommand field
+     * which is the offset (in bytes) from the start of the current header
+     * to the start of the next SMB2 header.  A value of 0 indicates no
+     * further commands. */
+    size_t offset = 0;
+    while (offset < len) {
+        /* Each SMB2 header is at least 64 bytes.  Ensure enough data */
+        if (len - offset < 64)
+            break;
+        const uint8_t *hdr = msg + offset;
+        /* Validate SMB2 signature FE 'S' 'M' 'B' */
+        if (!(hdr[0] == 0xFE && hdr[1] == 'S' && hdr[2] == 'M' && hdr[3] == 'B'))
+            break;
+        uint16_t struct_size = hdr[4] | (hdr[5] << 8);
+        if (struct_size != 64)
+            break;
+        uint16_t command = hdr[12] | (hdr[13] << 8);
+        uint32_t flags = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | (hdr[19] << 24);
+        uint32_t next_cmd = hdr[20] | (hdr[21] << 8) | (hdr[22] << 16) | (hdr[23] << 24);
+        uint64_t msg_id = 0;
+        for (int i = 0; i < 8; i++)
+            msg_id |= ((uint64_t)hdr[24 + i]) << (8 * i);
+        int is_response = (flags & SMB2_FLAGS_SERVER_TO_REDIR) != 0;
+        /* Calculate body length: if next_cmd is 0, body runs to end of packet;
+         * otherwise body ends at next_cmd offset.  Ensure we don't read
+         * beyond len.  */
+        size_t body_len;
+        if (next_cmd == 0) {
+            if (len > offset + 64)
+                body_len = len - offset - 64;
+            else
+                body_len = 0;
+        } else {
+            /* next_cmd specifies the offset from current SMB2 header to
+             * start of next one.  It must be at least 64 bytes for a
+             * complete header. */
+            if (next_cmd < 64 || offset + next_cmd > len) {
+                /* Malformed next_cmd.  Stop processing. */
+                break;
+            }
+            body_len = next_cmd - 64;
         }
-    } else {
-        /* Response */
-        if (command == SMB2_READ && dir == 1) {
-            handle_read_response(conn, msg_id, body, body_len);
+        const uint8_t *body = hdr + 64;
+        /* Dispatch based on command and direction */
+        if (!is_response) {
+            if (command == SMB2_READ && dir == 0) {
+                record_pending_read(conn, msg_id, body, body_len);
+            } else if (command == SMB2_WRITE && dir == 0) {
+                parse_write_request(body, body_len);
+            }
+        } else {
+            if (command == SMB2_READ && dir == 1) {
+                handle_read_response(conn, msg_id, body, body_len);
+            }
         }
-        /* Note: WRITE responses carry no file data */
+        /* Move to next command */
+        if (next_cmd == 0)
+            break;
+        offset += next_cmd;
     }
 }
 
